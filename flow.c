@@ -66,63 +66,6 @@
 #define ISSET(_v, _m)	((_v) & (_m))
 #endif
 
-static const unsigned int pkt_lens[] = {
-	64,
-	128,
-	256,
-	512,
-	1024,
-	1514,	/* XXX 1500 would make more sense for IP */
-	2048,
-	4096,
-	8192,
-	65535,	/* > 8192 */
-};
-
-#define NUM_PKT_LENS	nitems(pkt_lens)
-
-struct gre_header {
-	uint16_t		gre_flags;
-#define GRE_CP				0x8000	/* Checksum Present */
-#define GRE_KP				0x2000	/* Key Present */
-#define GRE_SP				0x1000	/* Sequence Present */
-
-#define GRE_VERS_MASK			0x0007
-#define GRE_VERS_0			0x0000
-#define GRE_VERS_1			0x0001
-
-	uint16_t		gre_proto;
-} __packed __aligned(4);
-
-struct gre_h_cksum {
-	uint16_t		gre_cksum;
-	uint16_t		gre_reserved1;
-} __packed __aligned(4);
-
-struct gre_h_key {
-	uint32_t		gre_key;
-} __packed __aligned(4);
-
-struct esp_header {
-	uint32_t		esp_spi;
-	uint32_t		esp_seq;
-} __packed __aligned(4);
-
-struct ah_header {
-	uint8_t			ah_proto;
-	uint8_t			ah_len;
-	uint16_t		ah_reserved;
-	uint32_t		ah_spi;
-	uint32_t		ah_seq;
-} __packed __aligned(4);
-
-struct sctp_header {
-	uint16_t		sctp_sport;
-	uint16_t		sctp_dport;
-	uint32_t		sctp_vtag;
-	uint32_t		sctp_cksum;
-} __packed __aligned(4);
-
 int		rdaemon(int);
 
 union flow_addr {
@@ -145,46 +88,16 @@ struct flow_key {
 	union flow_addr		k_daddr;
 #define k_daddr4			k_daddr.addr4
 #define k_daddr6			k_daddr.addr6
-
-#define k_icmp_type			k_sport
-#define k_icmp_code			k_dport
-
-#define k_gre_flags			k_sport
-#define k_gre_proto			k_dport
-
-	uint32_t		k_gre_key;
-#define k_ipsec_spi			k_gre_key
 } __aligned(8);
 
 struct flow {
-	struct flow_key		f_key;
-
-	uint64_t		f_packets;
-	uint64_t		f_bytes;
-	uint64_t		f_frags;
-
-	uint64_t		f_syns;
-	uint64_t		f_fins;
-	uint64_t		f_rsts;
-
-	uint64_t		f_pkt_lens[NUM_PKT_LENS];
-
-	uint16_t		f_min_tcpwin;
-	uint16_t		f_max_tcpwin;
-
-	unsigned int		f_min_pktlen;
-	unsigned int		f_max_pktlen;
-	uint8_t			f_min_ttl;
-	uint8_t			f_max_ttl;
-
-	RBT_ENTRY(flow)		f_entry_tree;
-	TAILQ_ENTRY(flow)	f_entry_list;
+	struct timeval		f_tv;
+	struct flow_key         f_key;
 };
 
-RBT_HEAD(flow_tree, flow);
-TAILQ_HEAD(flow_list, flow);
-
 struct lookup {
+	struct timeval		l_tv;
+
 	uint8_t			l_ipv;
 	union flow_addr		l_saddr;
 	union flow_addr		l_daddr;
@@ -198,6 +111,8 @@ struct lookup {
 };
 
 struct rdns {
+	struct timeval		r_tv;
+
 	char *			r_name;
 	uint32_t		r_ttl;
 	uint8_t			r_ipv;
@@ -209,31 +124,9 @@ struct rdns {
 TAILQ_HEAD(lookup_list, lookup);
 TAILQ_HEAD(rdns_list, rdns);
 
-static inline int
-flow_cmp(const struct flow *a, const struct flow *b)
-{
-	const struct flow_key *ka = &a->f_key;
-	const struct flow_key *kb = &b->f_key;
-	const unsigned long *la = (const unsigned long *)ka;
-	const unsigned long *lb = (const unsigned long *)kb;
-	size_t i;
-
-	for (i = 0; i < sizeof(*ka) / sizeof(*la); i++) {
-		if (la[i] > lb[i])
-			return (1);
-		if (la[i] < lb[i])
-			return (-1);
-	}
-
-	return (0);
-}
-
-RBT_PROTOTYPE(flow_tree, flow, f_entry_tree, flow_cmp);
-
 struct timeslice {
-	unsigned int		ts_flow_count;
-	struct flow_tree	ts_flow_tree;
-	struct flow_list	ts_flow_list;
+	unsigned int		ts_lookup_count;
+	unsigned int		ts_rdns_count;
 
 	struct lookup_list	ts_lookup_list;
 	struct rdns_list	ts_rdns_list;
@@ -263,7 +156,6 @@ struct timeslice {
 };
 
 struct timeslice	*timeslice_alloc(const struct timeval *);
-static struct flow	*flow_alloc(void);
 
 struct flow_daemon;
 
@@ -285,7 +177,6 @@ struct flow_daemon {
 	struct timeval		 d_tv;
 
 	struct pkt_sources	 d_pkt_sources;
-	struct flow		*d_flow;
 
 	struct timeslice	*d_ts;
 
@@ -441,8 +332,10 @@ main(int argc, char *argv[])
 		if (pcap_set_timeout(ps->ps_ph, 10) != 0)
 			errx(1, "%s", errbuf);
 
-		if (pcap_activate(ps->ps_ph) != 0)
-			errx(1, "%s", errbuf);
+		if (pcap_activate(ps->ps_ph) != 0) {
+			errx(1, "pcap activate %s: %s", argv[ch],
+			    pcap_geterr(ps->ps_ph));
+		}
 
 		if (pcap_setnonblock(ps->ps_ph, 1, errbuf) != 0)
 			errx(1, "%s", errbuf);
@@ -476,10 +369,6 @@ main(int argc, char *argv[])
 	d->d_taskq = taskq_create("store");
 	if (d->d_taskq == NULL)
 		err(1, "taskq");
-
-	d->d_flow = flow_alloc();
-	if (d->d_flow == NULL)
-		err(1, NULL);
 
 	gettimeofday(&now, NULL);
 
@@ -516,30 +405,105 @@ bpf_maxbufsize(void)
 	if (sysctl(mib, nitems(mib), &maxbuf, &maxbufsize, NULL, 0) == -1)
 		return (-1);
 
+	if (maxbuf > 1 << 20)
+		maxbuf = 1 << 20;
+
 	return (maxbuf);
 }
+
+static const struct bpf_insn bpf_insns[] = {
+	/* load ethertype */
+	{ BPF_LD|BPF_H|BPF_ABS,		0, 0,
+	    offsetof(struct ether_header, ether_type) },
+
+	/* is this a vlan packet? */
+	{ BPF_JMP|BPF_JEQ|BPF_K,	0, 2,	ETHERTYPE_VLAN },
+	/* offset further loads by the 4 byte vlan shim */
+	{ BPF_LDX|BPF_IMM,		0, 0,	4 },
+	{ BPF_LD|BPF_H|BPF_ABS,		0, 0,
+	    offsetof(struct ether_header, ether_type) + 4 },
+
+	/* is this an IPv4 packet? */
+	{ BPF_JMP|BPF_JEQ|BPF_K,	0, 9,	ETHERTYPE_IP },
+	/* is this the first (or only) fragment? */
+	{ BPF_LD|BPF_H|BPF_IND,		0, 0,
+	    sizeof(struct ether_header) + offsetof(struct ip, ip_off) },
+	{ BPF_JMP|BPF_JSET|BPF_K,	26, 0,	IP_OFFMASK },
+
+	/* sigh, can't do relatives MSH loads */
+	{ BPF_LD|BPF_B|BPF_IND,		0, 0,
+	    sizeof(struct ether_header) }, /* hl is after the ether header */
+	{ BPF_ALU|BPF_AND|BPF_K,	0, 0,	0xf },
+	{ BPF_ALU|BPF_LSH|BPF_K,	0, 0,	2 },
+	{ BPF_JMP|BPF_JGE|BPF_K,	0, 22,	sizeof(struct ip) },
+
+	/* store iphlen */
+	{ BPF_ST,			0, 0,	0 },
+
+	/* load ipproto */
+	{ BPF_LD|BPF_B|BPF_IND,		0, 0,
+	    sizeof(struct ether_header) + offsetof(struct ip, ip_p) },
+	{ BPF_JMP|BPF_JA,		0, 0,	10 }, /* jump over ipv6 */
+
+	/* is this an IPv6 packet? */
+	{ BPF_JMP|BPF_JEQ|BPF_K,	0, 18,	ETHERTYPE_IPV6 },
+	/* store iphlen */
+	{ BPF_LD|BPF_IMM,		0, 0,	sizeof(struct ip6_hdr) },
+	{ BPF_ST,			0, 0,	0 },
+
+	/* load ipproto */
+	{ BPF_LD|BPF_B|BPF_IND,		0, 0,
+	    sizeof(struct ether_header) + offsetof(struct ip6_hdr, ip6_nxt) },
+	/* is this an ipv6 fragment? */
+	{ BPF_JMP|BPF_JEQ|BPF_K,	0, 5,	IPPROTO_FRAGMENT },
+	{ BPF_LD|BPF_H|BPF_IND,		0, 0,
+	    sizeof(struct ether_header) + sizeof(struct ip6_hdr) +
+	    offsetof(struct ip6_frag, ip6f_offlg) },
+	{ BPF_JMP|BPF_JSET|BPF_K,	12, 0,	IP6F_OFF_MASK },
+	/* update iphlen */
+	{ BPF_LD|BPF_IMM,		0, 0,
+	    sizeof(struct ip6_hdr) + sizeof(struct ip6_frag) },
+	{ BPF_ST,			0, 0,	0 },
+
+	/* load ipproto again */
+	{ BPF_LD|BPF_B|BPF_IND,		0, 0,
+	    sizeof(struct ether_header) + sizeof(struct ip6_hdr) +
+	    offsetof(struct ip6_frag, ip6f_nxt) },
+
+	/* is this udp or tcp? */
+	{ BPF_JMP|BPF_JEQ|BPF_K,	1, 0,	IPPROTO_UDP },
+	{ BPF_JMP|BPF_JEQ|BPF_K,	0, 7,	IPPROTO_TCP },
+
+	/* check ports after skipping ip headers */
+	{ BPF_LD|BPF_MEM,		0, 0,	0 },
+	{ BPF_ALU|BPF_ADD|BPF_X,	0, 0,	0 },
+	{ BPF_MISC|BPF_TAX,		0, 0,	0 },
+
+	/*
+	 * X now contains the vlan shim len (or not), and the iphlen.
+	 * we haven't accounted for the ethernet header len yet, so
+	 * include it in the offset to the port(s).
+	 */
+	{ BPF_LD|BPF_H|BPF_IND,		0, 0,
+	    sizeof(struct ether_header) + 0 },
+	{ BPF_JMP|BPF_JEQ|BPF_K,	3, 0,	53 },
+	{ BPF_LD|BPF_H|BPF_IND,		0, 0,
+	    sizeof(struct ether_header) + 2 },
+	{ BPF_JMP|BPF_JEQ|BPF_K,	1, 0,	53 },
+
+	{ BPF_RET,			0, 0,	0 },
+	{ BPF_RET,			0, 0,	-1 },
+};
 
 static int
 flow_pcap_filter(pcap_t *p)
 {
-	struct bpf_insn bpf_filter[] = {
-		BPF_STMT(BPF_RET+BPF_K, pcap_snapshot(p)),
-	};
 	struct bpf_program bp = {
-		.bf_insns = bpf_filter,
-		.bf_len = nitems(bpf_filter),
+		.bf_insns = (struct bpf_insn *)bpf_insns,
+		.bf_len = nitems(bpf_insns),
 	};
 
 	return (pcap_setfilter(p, &bp));
-}
-
-static inline int
-flow_gre_key_valid(const struct flow *f)
-{
-	uint16_t v = f->f_key.k_gre_flags;
-	/* ignore checksum and seq no */
-	v &= ~htons(GRE_CP|GRE_SP);
-	return (v == htons(GRE_VERS_0|GRE_KP));
 }
 
 static struct addrinfo *
@@ -740,107 +704,36 @@ tv_to_msec(const struct timeval *tv)
 }
 
 static void
-timeslice_post_flows(struct timeslice *ts, struct buf *sqlbuf,
-    const char *st, const char *et)
-{
-	char ipbuf[NI_MAXHOST];
-	struct flow *f, *nf;
-	const struct flow_key *k;
-	size_t rows = 0;
-	const char *join = "";
-
-	if (TAILQ_EMPTY(&ts->ts_flow_list))
-		return;
-
-	buf_init(sqlbuf);
-	buf_cat(sqlbuf, "INSERT INTO flows ("
-	    "begin_at, end_at, "
-	    "vlan, ipv, ipproto, saddr, daddr, sport, dport, gre_key, "
-	    "packets, bytes, frags, syns, fins, rsts, mintcpwin, maxtcpwin, "
-	    "minpktlen, maxpktlen, min_ttl, max_ttl, pkt_lens"
-	    ")\n" "FORMAT Values\n");
-
-	TAILQ_FOREACH_SAFE(f, &ts->ts_flow_list, f_entry_list, nf) {
-		const char *mjoin = "";
-		unsigned int i;
-
-		k = &f->f_key;
-		buf_printf(sqlbuf, "%s('%s','%s',", join, st, et);
-		buf_printf(sqlbuf, "%u,%u,%u,", k->k_vlan, k->k_ipv,
-		    k->k_ipproto);
-		if (k->k_ipv == 4) {
-			inet_ntop(PF_INET, &k->k_saddr4, ipbuf, sizeof(ipbuf));
-			buf_printf(sqlbuf, "IPv4ToIPv6(toIPv4('%s')),", ipbuf);
-			inet_ntop(PF_INET, &k->k_daddr4, ipbuf, sizeof(ipbuf));
-			buf_printf(sqlbuf, "IPv4ToIPv6(toIPv4('%s')),", ipbuf);
-		} else if (k->k_ipv == 6) {
-			inet_ntop(PF_INET6, &k->k_saddr6, ipbuf, sizeof(ipbuf));
-			buf_printf(sqlbuf, "toIPv6('%s'),", ipbuf);
-			inet_ntop(PF_INET6, &k->k_daddr6, ipbuf, sizeof(ipbuf));
-			buf_printf(sqlbuf, "toIPv6('%s'),", ipbuf);
-		} else {
-			buf_printf(sqlbuf, "toIPv6('::'),toIPv6('::'),");
-		}
-		buf_printf(sqlbuf,
-		    "%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%u,%u,{",
-		    ntohs(k->k_sport), ntohs(k->k_dport), ntohl(k->k_gre_key),
-		    f->f_packets, f->f_bytes, f->f_frags,
-		    f->f_syns, f->f_fins, f->f_rsts,
-		    f->f_min_tcpwin, f->f_max_tcpwin,
-		    f->f_min_pktlen, f->f_max_pktlen,
-		    f->f_min_ttl, f->f_max_ttl);
-		for (i = 0; i < nitems(f->f_pkt_lens); i++) {
-			uint64_t pkts = f->f_pkt_lens[i];
-			if (pkts == 0)
-				continue;
-
-			buf_printf(sqlbuf, "%s%u:%llu", mjoin,
-			    pkt_lens[i], pkts);
-
-			mjoin = ",";
-		}
-		buf_printf(sqlbuf, "})");
-
-		free(f);
-		join = ",\n";
-
-		++rows;
-	}
-	buf_printf(sqlbuf, ";\n");
-
-	do_clickhouse_sql(sqlbuf, rows, "flow");
-}
-
-static void
 timeslice_post_flowstats(struct timeslice *ts, struct buf *sqlbuf,
     const char *st, const char *et)
 {
 	buf_init(sqlbuf);
-	buf_cat(sqlbuf, "INSERT INTO flowstats ("
+	buf_cat(sqlbuf, "INSERT INTO dnstapstats ("
 	    "begin_at, end_at, user_ms, kern_ms, "
-	    "reads, packets, bytes, flows, "
+	    "reads, packets, bytes, lookups, rdns, "
 	    "pcap_recv, pcap_drop, pcap_ifdrop, mdrop"
 	    ")\n" "FORMAT Values\n");
-	buf_printf(sqlbuf, "('%s','%s',", st, et);
+	buf_printf(sqlbuf, "(%s,%s,", st, et);
 	buf_printf(sqlbuf, "%u,%u,",
 	    tv_to_msec(&ts->ts_utime), tv_to_msec(&ts->ts_stime));
-	buf_printf(sqlbuf, "%llu,%llu,%llu,%lu,", ts->ts_reads,
-	    ts->ts_packets, ts->ts_bytes, ts->ts_flow_count);
+	buf_printf(sqlbuf, "%llu,%llu,%llu,%lu,%lu,", ts->ts_reads,
+	    ts->ts_packets, ts->ts_bytes,
+	    ts->ts_lookup_count, ts->ts_rdns_count);
 	buf_printf(sqlbuf, "%u,%u,%u,%llu", ts->ts_pcap_recv, ts->ts_pcap_drop,
 	    ts->ts_pcap_ifdrop, ts->ts_mdrop);
 	buf_cat(sqlbuf, ");\n");
 
-	do_clickhouse_sql(sqlbuf, 1, "flowstats");
+	do_clickhouse_sql(sqlbuf, 1, "dnstapstats");
 }
 
 static void
-timeslice_post_lookups(struct timeslice *ts, struct buf *sqlbuf,
-    const char *st, const char *et)
+timeslice_post_lookups(struct timeslice *ts, struct buf *sqlbuf)
 {
 	char ipbuf[NI_MAXHOST];
 	struct lookup *l, *nl;
 	size_t rows = 0;
 	const char *join = "";
+	char st[128];
 
 	if (TAILQ_EMPTY(&ts->ts_lookup_list))
 		return;
@@ -851,7 +744,11 @@ timeslice_post_lookups(struct timeslice *ts, struct buf *sqlbuf,
 	    ")\n" "FORMAT Values\n");
 
 	TAILQ_FOREACH_SAFE(l, &ts->ts_lookup_list, l_entry, nl) {
-		buf_printf(sqlbuf, "%s('%s','%s',", join, st, et);
+		snprintf(st, sizeof(st), "%lld.%06lld",
+		    (long long)l->l_tv.tv_sec,
+		    (long long)l->l_tv.tv_usec);
+
+		buf_printf(sqlbuf, "%s(%s,%s,", join, st, st);
 		if (l->l_ipv == 4) {
 			inet_ntop(PF_INET, &l->l_saddr.addr4.s_addr,
 			    ipbuf, sizeof(ipbuf));
@@ -884,16 +781,14 @@ timeslice_post_lookups(struct timeslice *ts, struct buf *sqlbuf,
 }
 
 static void
-timeslice_post_rdns(struct timeslice *ts, struct buf *sqlbuf,
-    const char *st)
+timeslice_post_rdns(struct timeslice *ts, struct buf *sqlbuf)
 {
 	char ipbuf[NI_MAXHOST];
 	struct rdns *r, *nr;
 	size_t rows = 0;
 	const char *join = "";
 
-	struct tm tm;
-	time_t time;
+	char st[128];
 	char et[128];
 
 	if (TAILQ_EMPTY(&ts->ts_rdns_list))
@@ -905,14 +800,14 @@ timeslice_post_rdns(struct timeslice *ts, struct buf *sqlbuf,
 	    ")\n" "FORMAT Values\n");
 
 	TAILQ_FOREACH_SAFE(r, &ts->ts_rdns_list, r_entry, nr) {
-		time = ts->ts_end.tv_sec + r->r_ttl;
-		gmtime_r(&time, &tm);
-		et[0] = '\0';
-		strftime(et, sizeof (et), "%Y-%m-%d %H:%M:%S", &tm);
-		snprintf(et, sizeof (et), "%s.%03lu", et,
-		    (ts->ts_end.tv_usec / 1000) % 1000);
+		snprintf(st, sizeof(st), "%lld.%06lld",
+		    (long long)r->r_tv.tv_sec,
+		    (long long)r->r_tv.tv_usec);
+		snprintf(st, sizeof(st), "%lld.%06lld",
+		    (long long)r->r_tv.tv_sec + r->r_ttl,
+		    (long long)r->r_tv.tv_usec);
 
-		buf_printf(sqlbuf, "%s('%s','%s',", join, st, et);
+		buf_printf(sqlbuf, "%s(%s,%s,", join, st, et);
 
 		if (r->r_ipv == 4) {
 			inet_ntop(PF_INET, &r->r_addr.addr4.s_addr,
@@ -944,29 +839,20 @@ timeslice_post(void *arg)
 	struct timeslice *ts = arg;
 
 	char stbuf[128], etbuf[128];
-	struct tm tm;
-	time_t time;
 
 	static struct buf sqlbuf;
 
-	time = ts->ts_begin.tv_sec;
-	gmtime_r(&time, &tm);
-	stbuf[0] = '\0';
-	strftime(stbuf, sizeof (stbuf), "%Y-%m-%d %H:%M:%S", &tm);
-	snprintf(stbuf, sizeof (stbuf), "%s.%03lu", stbuf,
-	    (ts->ts_begin.tv_usec / 1000) % 1000);
+	snprintf(stbuf, sizeof(stbuf), "%lld.%06lld",
+	    (long long)ts->ts_begin.tv_sec,
+	    (long long)ts->ts_begin.tv_usec);
 
-	time = ts->ts_end.tv_sec;
-	gmtime_r(&time, &tm);
-	etbuf[0] = '\0';
-	strftime(etbuf, sizeof (etbuf), "%Y-%m-%d %H:%M:%S", &tm);
-	snprintf(etbuf, sizeof (etbuf), "%s.%03lu", etbuf,
-	    (ts->ts_end.tv_usec / 1000) % 1000);
+	snprintf(etbuf, sizeof(etbuf), "%lld.%06lld",
+	    (long long)ts->ts_end.tv_sec,
+	    (long long)ts->ts_end.tv_usec);
 
-	timeslice_post_flows(ts, &sqlbuf, stbuf, etbuf);
 	timeslice_post_flowstats(ts, &sqlbuf, stbuf, etbuf);
-	timeslice_post_lookups(ts, &sqlbuf, stbuf, etbuf);
-	timeslice_post_rdns(ts, &sqlbuf, stbuf);
+	timeslice_post_lookups(ts, &sqlbuf);
+	timeslice_post_rdns(ts, &sqlbuf);
 
 	free(ts);
 }
@@ -981,31 +867,12 @@ timeslice_alloc(const struct timeval *now)
 		return (NULL);
 
 	ts->ts_begin = *now;
-	ts->ts_flow_count = 0;
-	RBT_INIT(flow_tree, &ts->ts_flow_tree);
-	TAILQ_INIT(&ts->ts_flow_list);
 	TAILQ_INIT(&ts->ts_lookup_list);
 	TAILQ_INIT(&ts->ts_rdns_list);
 
 	task_set(&ts->ts_task, timeslice_post, ts);
 
 	return (ts);
-}
-
-static struct flow *
-flow_alloc(void)
-{
-	struct flow *f;
-	size_t i;
-
-	f = malloc(sizeof(*f));
-	if (f == NULL)
-		return (NULL);
-
-	for (i = 0; i < nitems(f->f_pkt_lens); i++)
-		f->f_pkt_lens[i] = 0;
-
-	return (f);
 }
 
 static void
@@ -1096,6 +963,7 @@ pkt_count_dns_buf(struct timeslice *ts, struct flow *f, struct dns_buf *db)
 			return (DNS_R_NOMEM);
 		}
 
+		l->l_tv = f->f_tv;
 		l->l_ipv = f->f_key.k_ipv;
 		l->l_saddr = f->f_key.k_saddr;
 		l->l_daddr = f->f_key.k_daddr;
@@ -1103,6 +971,7 @@ pkt_count_dns_buf(struct timeslice *ts, struct flow *f, struct dns_buf *db)
 		l->l_dport = f->f_key.k_dport;
 		l->l_qid = h->dh_id;
 
+		ts->ts_lookup_count++;
 		TAILQ_INSERT_TAIL(&ts->ts_lookup_list, l, l_entry);
 	}
 
@@ -1134,10 +1003,12 @@ pkt_count_dns_buf(struct timeslice *ts, struct flow *f, struct dns_buf *db)
 			return (DNS_R_NOMEM);
 		}
 
+		r->r_tv = f->f_tv;
 		r->r_ipv = ipv;
 		r->r_ttl = dr->dr_ttl;
 		r->r_addr = addr;
 
+		ts->ts_rdns_count++;
 		TAILQ_INSERT_TAIL(&ts->ts_rdns_list, r, r_entry);
 	}
 
@@ -1190,13 +1061,6 @@ pkt_count_tcp(struct timeslice *ts, struct flow *f,
 
 	f->f_key.k_sport = th->th_sport;
 	f->f_key.k_dport = th->th_dport;
-	if ((th->th_flags & (TH_SYN | TH_ACK)) == TH_SYN)
-		f->f_syns = 1;
-	if (th->th_flags & TH_FIN)
-		f->f_fins = 1;
-	if ((th->th_flags & (TH_RST | TH_ACK)) == TH_RST)
-		f->f_rsts = 1;
-	f->f_min_tcpwin = f->f_max_tcpwin = ntohs(th->th_win);
 
 	if ((th->th_dport == htons(53) || th->th_sport == htons(53)) &&
 	    buflen > th->th_off * 4) {
@@ -1239,98 +1103,6 @@ pkt_count_udp(struct timeslice *ts, struct flow *f,
 }
 
 static int
-pkt_count_gre(struct timeslice *ts, struct flow *f,
-    const u_char *buf, u_int buflen)
-{
-	const struct gre_header *gh;
-	const struct gre_h_key *gkh;
-	u_int hlen;
-
-	if (buflen < sizeof(*gh)) {
-		ts->ts_short_ipproto++;
-		return (-1);
-	}
-
-	gh = (const struct gre_header *)buf;
-
-	f->f_key.k_gre_flags = gh->gre_flags;
-	f->f_key.k_gre_proto = gh->gre_proto;
-
-	if (!flow_gre_key_valid(f))
-		return (0);
-
-	hlen = sizeof(*gh);
-	if (ISSET(f->f_key.k_gre_flags, htons(GRE_CP)))
-		hlen += sizeof(struct gre_h_cksum);
-	gkh = (const struct gre_h_key *)buf;
-	hlen += sizeof(*gkh);
-	if (buflen < hlen) {
-		return ts->ts_short_ipproto++;
-		return (-1);
-	}
-
-	f->f_key.k_gre_key = gkh->gre_key;
-
-	return (0);
-}
-
-static int
-pkt_count_esp(struct timeslice *ts, struct flow *f,
-    const u_char *buf, u_int buflen)
-{
-	const struct esp_header *eh;
-
-	if (buflen < sizeof(*eh)) {
-		ts->ts_short_ipproto++;
-		return (-1);
-	}
-
-	eh = (const struct esp_header *)buf;
-
-	f->f_key.k_ipsec_spi = eh->esp_spi;
-
-	return (0);
-}
-
-static int
-pkt_count_ah(struct timeslice *ts, struct flow *f,
-    const u_char *buf, u_int buflen)
-{
-	const struct ah_header *ah;
-
-	if (buflen < sizeof(*ah)) {
-		ts->ts_short_ipproto++;
-		return (-1);
-	}
-
-	ah = (const struct ah_header *)buf;
-
-	f->f_key.k_ipsec_spi = ah->ah_spi;
-
-	return (0);
-}
-
-static int
-pkt_count_sctp(struct timeslice *ts, struct flow *f,
-    const u_char *buf, u_int buflen)
-{
-	const struct sctp_header *sh;
-
-	if (buflen < sizeof(*sh)) {
-		ts->ts_short_ipproto++;
-		return (-1);
-	}
-
-	sh = (const struct sctp_header *)buf;
-
-	f->f_key.k_sport = sh->sctp_sport;
-	f->f_key.k_dport = sh->sctp_dport;
-	f->f_key.k_gre_key = sh->sctp_vtag;
-
-	return (0);
-}
-
-static int
 pkt_count_ipproto(struct timeslice *ts, struct flow *f,
     const u_char *buf, u_int buflen)
 {
@@ -1338,45 +1110,7 @@ pkt_count_ipproto(struct timeslice *ts, struct flow *f,
 	case IPPROTO_TCP:
 		return (pkt_count_tcp(ts, f, buf, buflen));
 	case IPPROTO_UDP:
-	case IPPROTO_UDPLITE:
 		return (pkt_count_udp(ts, f, buf, buflen));
-	case IPPROTO_GRE:
-		return (pkt_count_gre(ts, f, buf, buflen));
-	case IPPROTO_ESP:
-		return (pkt_count_esp(ts, f, buf, buflen));
-	case IPPROTO_AH:
-		return (pkt_count_ah(ts, f, buf, buflen));
-	case IPPROTO_SCTP:
-		return (pkt_count_sctp(ts, f, buf, buflen));
-	}
-
-	return (0);
-}
-
-static int
-pkt_count_icmp4(struct timeslice *ts, struct flow *f,
-    const u_char *buf, u_int buflen)
-{
-	const struct icmp *icmp4h;
-
-	if (buflen < offsetof(struct icmp, icmp_cksum)) {
-		ts->ts_short_ipproto++;
-		return (-1);
-	}
-
-	icmp4h = (const struct icmp *)buf;
-
-	f->f_key.k_icmp_type = htons(icmp4h->icmp_type);
-	f->f_key.k_icmp_code = htons(icmp4h->icmp_code);
-	switch (icmp4h->icmp_type) {
-	case ICMP_ECHO:
-	case ICMP_ECHOREPLY:
-		if (buflen < offsetof(struct icmp, icmp_seq)) {
-			ts->ts_short_ipproto++;
-			return (-1);
-		}
-		f->f_key.k_gre_key = htonl(ntohs(icmp4h->icmp_id));
-		break;
 	}
 
 	return (0);
@@ -1413,50 +1147,14 @@ pkt_count_ip4(struct timeslice *ts, struct flow *f,
 	if (iph->ip_off & htons(~(IP_DF | IP_RF))) {
 		if ((iph->ip_off & htons(IP_OFFMASK)) != htons(0))
 			proto = IPPROTO_FRAGMENT;
-
-		f->f_frags = 1;
 	}
 
 	f->f_key.k_ipv = 4;
 	f->f_key.k_ipproto = proto;
 	f->f_key.k_saddr4 = iph->ip_src;
 	f->f_key.k_daddr4 = iph->ip_dst;
-	f->f_min_ttl = f->f_max_ttl = iph->ip_ttl;
-
-	if (f->f_key.k_ipproto == IPPROTO_ICMP)
- 		return (pkt_count_icmp4(ts, f, buf, buflen));
 
 	return (pkt_count_ipproto(ts, f, buf, buflen));
-}
-
-static int
-pkt_count_icmp6(struct timeslice *ts, struct flow *f,
-    const u_char *buf, u_int buflen)
-{
-	const struct icmp6_hdr *icmp6h;
-
-	if (buflen < offsetof(struct icmp6_hdr, icmp6_cksum)) {
-		ts->ts_short_ipproto++;
-		return (-1);
-	}
-
-	icmp6h = (const struct icmp6_hdr *)buf;
-
-	f->f_key.k_icmp_type = htons(icmp6h->icmp6_type);
-	f->f_key.k_icmp_code = htons(icmp6h->icmp6_code);
-
-	switch (icmp6h->icmp6_type) {
-	case ICMP6_ECHO_REQUEST:
-	case ICMP6_ECHO_REPLY:
-		if (buflen < offsetof(struct icmp6_hdr, icmp6_seq)) {
-			ts->ts_short_ipproto++;
-			return (-1);
-		}
-		f->f_key.k_gre_key = htonl(ntohs(icmp6h->icmp6_id));
-		break;
-	}
-
-	return (0);
 }
 
 static int
@@ -1494,34 +1192,14 @@ pkt_count_ip6(struct timeslice *ts, struct flow *f,
 			buflen -= sizeof(*ip6f);
 			nxt = ip6f->ip6f_nxt;
 		}
-
-		f->f_frags = 1;
 	}
 
 	f->f_key.k_ipv = 6;
 	f->f_key.k_ipproto = nxt;
 	f->f_key.k_saddr6 = ip6->ip6_src;
 	f->f_key.k_daddr6 = ip6->ip6_dst;
-	f->f_min_ttl = f->f_max_ttl = ip6->ip6_hlim;
-
-	if (nxt == IPPROTO_ICMPV6)
-		return (pkt_count_icmp6(ts, f, buf, buflen));
 
 	return (pkt_count_ipproto(ts, f, buf, buflen));
-}
-
-static inline unsigned int
-pkt_len_bucket(unsigned int pktlen)
-{
-	unsigned int i;
-
-	/* the last bucket is special */
-	for (i = 0; i < NUM_PKT_LENS - 1; i++) {
-		if (pktlen <= pkt_lens[i])
-			break;
-	}
-
-	return (i);
 }
 
 static void
@@ -1529,9 +1207,11 @@ pkt_count(u_char *arg, const struct pcap_pkthdr *hdr, const u_char *buf)
 {
 	struct flow_daemon *d = (struct flow_daemon *)arg;
 	struct timeslice *ts = d->d_ts;
-	struct flow *f = d->d_flow;
-	struct flow *of;
-	unsigned int len_bucket;
+	struct flow _f = {
+		.f_tv = { hdr->ts.tv_sec, hdr->ts.tv_usec },
+
+	};
+	struct flow *f = &_f;
 
 	struct ether_header *eh;
 	uint16_t type;
@@ -1539,8 +1219,6 @@ pkt_count(u_char *arg, const struct pcap_pkthdr *hdr, const u_char *buf)
 
 	u_int buflen = hdr->caplen;
 	u_int pktlen = hdr->len;
-
-	memset(&f->f_key, 0, sizeof(f->f_key));
 
 	if (buflen < hlen) {
 		ts->ts_short_ether++;
@@ -1572,18 +1250,6 @@ pkt_count(u_char *arg, const struct pcap_pkthdr *hdr, const u_char *buf)
 	ts->ts_packets++;
 	ts->ts_bytes += pktlen;
 
-	f->f_packets = 1;
-	f->f_bytes = pktlen;
-	f->f_frags = 0;
-	f->f_syns = 0;
-	f->f_fins = 0;
-	f->f_rsts = 0;
-	f->f_min_tcpwin = 0;
-	f->f_max_tcpwin = 0;
-	f->f_min_pktlen = pktlen;
-	f->f_max_pktlen = pktlen;
-	f->f_min_ttl = f->f_max_ttl = 0;
-
 	switch (type) {
 	case htons(ETHERTYPE_IP):
 		if (pkt_count_ip4(ts, f, buf, buflen) == -1)
@@ -1598,51 +1264,6 @@ pkt_count(u_char *arg, const struct pcap_pkthdr *hdr, const u_char *buf)
 		ts->ts_nonip++;
 		return;
 	}
-
-	of = RBT_INSERT(flow_tree, &ts->ts_flow_tree, f);
-	if (of == NULL) {
-		struct flow *nf = flow_alloc();
-		if (nf == NULL) {
-			/* drop this packet due to lack of memory */
-			RBT_REMOVE(flow_tree, &ts->ts_flow_tree, f);
-			ts->ts_mdrop++;
-			return;
-		}
-		d->d_flow = nf;
-
-		ts->ts_flow_count++;
-		TAILQ_INSERT_TAIL(&ts->ts_flow_list, f, f_entry_list);
-
-		of = f;
-	} else {
-		of->f_packets++;
-		of->f_bytes += f->f_bytes;
-		of->f_frags += f->f_frags;
-
-		if (f->f_key.k_ipproto == IPPROTO_TCP) {
-			of->f_syns += f->f_syns;
-			of->f_fins += f->f_fins;
-			of->f_rsts += f->f_rsts;
-
-			if (of->f_min_tcpwin > f->f_min_tcpwin)
-				of->f_min_tcpwin = f->f_min_tcpwin;
-			if (of->f_max_tcpwin < f->f_max_tcpwin)
-				of->f_max_tcpwin = f->f_max_tcpwin;
-		}
-
-		if (of->f_min_pktlen > f->f_min_pktlen)
-			of->f_min_pktlen = f->f_min_pktlen;
-		if (of->f_max_pktlen < f->f_max_pktlen)
-			of->f_max_pktlen = f->f_max_pktlen;
-
-		if (of->f_min_ttl > f->f_min_ttl)
-			of->f_min_ttl = f->f_min_ttl;
-		if (of->f_max_ttl < f->f_max_ttl)
-			of->f_max_ttl = f->f_max_ttl;
-	}
-
-	len_bucket = pkt_len_bucket(pktlen);
-	of->f_pkt_lens[len_bucket]++;
 }
 
 void
@@ -1657,8 +1278,6 @@ pkt_capture(int fd, short events, void *arg)
 
 	ts->ts_reads++;
 }
-
-RBT_GENERATE(flow_tree, flow, f_entry_tree, flow_cmp);
 
 /* daemon(3) clone, intended to be used in a "r"estricted environment */
 int

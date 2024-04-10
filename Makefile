@@ -1,5 +1,5 @@
 
-PROG=	flow
+PROG=	dnstap
 SRCS=	flow.c
 #PROG=	dnstest
 #SRCS=	dns_test.c
