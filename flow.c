@@ -803,7 +803,7 @@ timeslice_post_rdns(struct timeslice *ts, struct buf *sqlbuf)
 		snprintf(st, sizeof(st), "%lld.%06lld",
 		    (long long)r->r_tv.tv_sec,
 		    (long long)r->r_tv.tv_usec);
-		snprintf(st, sizeof(st), "%lld.%06lld",
+		snprintf(et, sizeof(et), "%lld.%06lld",
 		    (long long)r->r_tv.tv_sec + r->r_ttl,
 		    (long long)r->r_tv.tv_usec);
 
