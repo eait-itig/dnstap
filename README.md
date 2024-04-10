@@ -1,21 +1,4 @@
-# flow-collector(8)
+# dnstap
 
-flow-collector aggregates IP flow data for storage in a ClickHouse
-database.
-
-IP flows are generated from packets captured on one or more Ethernet
-interfaces, typically connected to SPAN ports on switches. This
-allows for the aggregation of flow information in a redundant
-switching environment.
-
-Flows are collected within timeslices, each of which is 2.5 seconds
-long by default.
-
-The collector also features parsing of DNS packets for building
-mappings of IPs to names.
-
-## Todo
-
-- Improve the robustness of the POSTs into clickhouse
-- Improve handling of memory shortages
-  - investigate merging timeslices under memory pressure
+dnstap captures packets on port 53 via bpf and tries to read DNS
+packets and record information out of them in a clickhouse database.
